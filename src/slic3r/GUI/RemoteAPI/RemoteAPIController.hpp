@@ -79,6 +79,13 @@ private:
     Response handle_select_plate(int index);                // plates: POST /plates/{i}/select
     Response handle_delete_plate(int index);                // plates: DELETE /plates/{i}
     Response handle_put_object_plate(uint64_t id, const std::string &body); // plates: POST /objects/{id}/plate
+    Response handle_get_project();                                 // project: GET /project
+    Response handle_save_project(const std::string &body);         // project: POST /project/save
+    Response handle_open_project(const std::string &body);         // project: POST /project/open
+    Response handle_new_project(const std::string &body);          // project: POST /project/new
+    Response handle_patch_plate(int index, const std::string &body); // plate_settings: PATCH /plates/{i}
+    Response handle_get_filaments();                               // filament_slots: GET /filaments
+    Response handle_put_filament_slot(int slot, const std::string &body); // filament_slots: PUT /filaments/{slot}
 
     // Mutate m_slice under the lock and broadcast a snapshot (event_name) to WS clients.
     void set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name);

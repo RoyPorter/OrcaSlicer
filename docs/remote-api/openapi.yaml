@@ -290,6 +290,70 @@ paths:
               example: { error: "last_plate" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "504": { $ref: "#/components/responses/UiTimeout" }
+    patch:
+      summary: Set a plate's own bed type, name and print sequence
+      operationId: patchPlate
+      description: |
+        What the Plate Settings dialog writes. Each field is optional or null; only a
+        real change is applied, and it marks the plate's slice stale and the project
+        dirty. `default` takes an override away (the plate follows the project-wide
+        `curr_bed_type` / the print preset's `print_sequence` again).
+      parameters:
+        - name: index
+          in: path
+          required: true
+          schema: { type: integer, minimum: 0 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bed_type:
+                  type: string
+                  nullable: true
+                  description: "A `curr_bed_type` enum key (case-insensitive) or `default`."
+                  enum: [default, Cool Plate, Engineering Plate, High Temp Plate, Textured PEI Plate, Textured Cool Plate, Supertack Plate]
+                name: { type: string, nullable: true }
+                print_sequence:
+                  type: string
+                  nullable: true
+                  enum: [default, by_layer, by_object]
+            example: { bed_type: "Textured PEI Plate", print_sequence: "by_object" }
+      responses:
+        "200":
+          description: Applied (or nothing differed).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  changed: { type: array, items: { type: string, enum: [bed_type, print_sequence, name] } }
+                  plate: { $ref: "#/components/schemas/Plate" }
+        "400":
+          description: Bad field.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                bed:   { value: { error: "unknown_bed_type", allowed: [default, "Cool Plate"] } }
+                seq:   { value: { error: "unknown_print_sequence" } }
+                empty: { value: { error: "nothing_to_set" } }
+        "404":
+          description: No plate with that index.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "unknown_plate", count: 2 }
+        "409":
+          description: A slice is running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "slicing" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
   /plates/{index}/select:
     post:
       summary: Make a plate the current one
@@ -406,6 +470,300 @@ paths:
                 failed: { value: { error: "move_failed" } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "504": { $ref: "#/components/responses/UiTimeout" }
+  /project:
+    get:
+      summary: Project name, path and dirty state
+      operationId: getProject
+      responses:
+        "200":
+          description: The open project.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Project"
+                  - type: object
+                    properties:
+                      modified:
+                        type: array
+                        description: Preset groups with unsaved edits.
+                        items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+  /project/save:
+    post:
+      summary: Save the project (File > Save / Save As)
+      operationId: saveProject
+      description: |
+        Writes the project 3MF exactly as the menu does (plates, placement, per-object
+        and per-plate settings, slot presets and colours, unsaved config edits) with
+        no dialog. Without `path` the project is saved to its own path. With a `path`
+        it is Save As, which refuses an existing file unless `overwrite` is true;
+        saving onto the project's own path never counts as overwriting.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path: { type: string, nullable: true, description: "A .3mf path on the OrcaSlicer host." }
+                overwrite: { type: boolean, default: false }
+            example: { path: "/Users/me/float_spinner.3mf" }
+      responses:
+        "200":
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved: { type: string, description: "The project path as now stored." }
+                  bytes: { type: integer }
+                  project: { $ref: "#/components/schemas/Project" }
+        "400":
+          description: The path does not end in .3mf, or a field has the wrong type.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "not_3mf" }
+        "404":
+          description: The target folder does not exist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "directory_not_found", path: "/nowhere/a.3mf" }
+        "409":
+          description: A file is already there (pass overwrite), or a slice is running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                exists:  { value: { error: "exists", path: "/Users/me/a.3mf" } }
+                slicing: { value: { error: "slicing" } }
+        "422":
+          description: The project has never been saved and no path was given, or the export failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                nopath: { value: { error: "no_project_path" } }
+                failed: { value: { error: "save_failed", path: "/Users/me/a.3mf" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+  /project/open:
+    post:
+      summary: Open a project (File > Open Project)
+      operationId: openProject
+      description: |
+        Loads plates, objects, per-object and per-plate settings, slot presets and
+        colours, and the project's config: not a geometry import. `if_unsaved`
+        answers the "save changes to the current project?" prompt; `presets` says
+        whether the project's presets are selected afterwards or the ones selected
+        before the call. Unsaved preset edits are dropped before the open (the
+        project's config replaces them) and named in `discarded_changes`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string, description: "A .3mf path on the OrcaSlicer host." }
+                if_unsaved: { type: string, enum: [save, discard, fail], default: fail }
+                presets: { type: string, enum: [project, keep_current], default: project }
+            example: { path: "/Users/me/float_spinner.3mf", if_unsaved: "discard" }
+      responses:
+        "200":
+          description: Opened.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  opened: { type: string }
+                  plates: { type: integer }
+                  objects: { type: integer }
+                  had_unsaved_changes: { type: boolean }
+                  saved: { type: string, description: "Where the previous project was saved (if_unsaved: save)." }
+                  discarded_changes: { type: array, items: { type: string } }
+                  presets_restored: { type: array, items: { type: string }, description: "presets: keep_current only." }
+                  presets:
+                    type: object
+                    properties:
+                      printer: { type: string }
+                      print: { type: string }
+                      filaments: { type: array, items: { type: string } }
+                  project: { $ref: "#/components/schemas/Project" }
+        "400":
+          description: Missing path or a bad enum value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                path:    { value: { error: "missing_path" } }
+                unsaved: { value: { error: "bad_if_unsaved", detail: "save | discard | fail" } }
+                presets: { value: { error: "bad_presets", detail: "project | keep_current" } }
+        "404":
+          description: No file at that path.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "file_not_found", path: "/Users/me/missing.3mf" }
+        "409":
+          description: A slice is running, or another project is still loading.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                slicing: { value: { error: "slicing" } }
+                busy:    { value: { error: "busy" } }
+        "422":
+          description: Unsaved changes with if_unsaved fail, no path to save to, not a 3MF, or the load failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                unsaved: { value: { error: "unsaved_changes", detail: "pass if_unsaved: \"save\" or \"discard\"", modified: ["print"] } }
+                nopath:  { value: { error: "no_project_path" } }
+                format:  { value: { error: "unsupported_format" } }
+                failed:  { value: { error: "load_failed", path: "/Users/me/a.3mf" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+  /project/new:
+    post:
+      summary: Start a new project (File > New Project)
+      operationId: newProject
+      description: |
+        Same `if_unsaved` handling as open. The GUI's "keep the modified presets or
+        discard them?" prompt is answered with Keep: unsaved preset edits carry over
+        and are named in `kept_changes`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                if_unsaved: { type: string, enum: [save, discard, fail], default: fail }
+      responses:
+        "200":
+          description: A new, empty project is open.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, enum: [true] }
+                  had_unsaved_changes: { type: boolean }
+                  saved: { type: string }
+                  kept_changes: { type: array, items: { type: string } }
+                  project: { $ref: "#/components/schemas/Project" }
+        "400":
+          description: Bad if_unsaved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "bad_if_unsaved" }
+        "409":
+          description: A slice is running, or a project is still loading.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "slicing" }
+        "422":
+          description: Unsaved changes with if_unsaved fail, or no path to save to.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "unsaved_changes" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+  /filaments:
+    get:
+      summary: The project's filament slots
+      operationId: getFilaments
+      responses:
+        "200":
+          description: One entry per slot, 1-based as the window numbers them.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slots:
+                    type: array
+                    items: { $ref: "#/components/schemas/FilamentSlot" }
+                  count: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
+  /filaments/{slot}:
+    put:
+      summary: Assign a filament preset and/or colour to a slot
+      operationId: putFilamentSlot
+      description: |
+        What the Prepare page's slot dropdown and colour swatch do. A preset that
+        carries a `default_filament_colour` recolours the slot unless a `colour` is
+        passed too. Unsaved print and printer edits are left alone; on a
+        single-filament printer unsaved filament edits are dropped so the Filament
+        tab can follow the preset, as the dropdown does (`discarded_changes`).
+      parameters:
+        - name: slot
+          in: path
+          required: true
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                preset: { type: string, nullable: true, description: "A filament preset name (user presets included)." }
+                colour: { type: string, nullable: true, description: "#RRGGBB or #RRGGBBAA." }
+            example: { preset: "My LW-ASA", colour: "#808080" }
+      responses:
+        "200":
+          description: The slot as it is now.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slot: { type: integer }
+                  preset: { type: string }
+                  colour: { type: string }
+                  changed: { type: array, items: { type: string, enum: [preset, colour] } }
+                  discarded_changes: { type: array, items: { type: string } }
+        "400":
+          description: Bad colour, nothing to set, or a bad slot number.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                colour: { value: { error: "bad_colour", detail: "\"red\" is not a #RRGGBB or #RRGGBBAA colour" } }
+                empty:  { value: { error: "nothing_to_set" } }
+        "404":
+          description: No such slot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "unknown_slot", count: 4 }
+        "409":
+          description: A slice is running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "slicing" }
+        "422":
+          description: No filament preset with that name.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "unknown_preset", preset: "LW-ASA" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "504": { $ref: "#/components/responses/UiTimeout" }
 components:
   securitySchemes:
     ApiToken:
@@ -446,14 +804,16 @@ components:
         capabilities:
           type: array
           items: { type: string }
-          example: [status, config, slice, events, plates]
+          example: [status, config, slice, events, plates, project, plate_settings, filament_slots]
         plates:
           type: object
           description: How many plates the project has and which one is current.
           properties:
             count: { type: integer }
             current: { type: integer }
-        project: { type: string, description: "Current project filename (may be empty)." }
+        project: { type: string, description: "Current project path (empty until saved)." }
+        project_name: { type: string, description: "The name in the window title (Untitled for a new project)." }
+        project_dirty: { type: boolean, description: "True when File > Save has something to write." }
         objects:
           type: array
           items:
@@ -485,6 +845,10 @@ components:
         locked: { type: boolean }
         empty: { type: boolean }
         slice_result_valid: { type: boolean }
+        bed_type: { type: string, description: "The plate's own bed type, or `default` when it follows the project's curr_bed_type." }
+        bed_type_effective: { type: string, description: "What the plate is sliced with." }
+        print_sequence: { type: string, enum: [default, by_layer, by_object], description: "The plate's own override, or `default`." }
+        print_sequence_effective: { type: string, enum: [by_layer, by_object] }
         origin: { $ref: "#/components/schemas/Vec3" }
         bbox_min: { $ref: "#/components/schemas/Vec3" }
         bbox_max: { $ref: "#/components/schemas/Vec3" }
@@ -497,6 +861,23 @@ components:
               id: { type: integer }
               instance: { type: integer }
               name: { type: string }
+    Project:
+      type: object
+      properties:
+        name: { type: string }
+        path: { type: string, description: "Empty until the project has been saved." }
+        saved: { type: boolean }
+        dirty: { type: boolean, description: "Plater edits, modified presets, or undo-stack changes since the last save." }
+        plates: { type: integer }
+        objects: { type: integer }
+    FilamentSlot:
+      type: object
+      properties:
+        slot: { type: integer, description: "1-based." }
+        preset: { type: string }
+        colour: { type: string }
+        type: { type: string, description: "The preset's filament_type." }
+        system: { type: boolean }
     PlateList:
       type: object
       properties:

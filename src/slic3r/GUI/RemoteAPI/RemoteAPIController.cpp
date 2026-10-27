@@ -26,6 +26,8 @@
 #include <miniz.h>                        // plate_render: RGBA -> PNG in memory
 #include "libslic3r/FlushVolCalc.hpp"      // project scope: g_max_flush_volume bound
 #include "slic3r/GUI/WipeTowerDialog.hpp"  // project scope: is_flush_config_modified
+#include "slic3r/GUI/GUI.hpp"              // project: into_path for the 3mf paths
+#include "slic3r/GUI/PresetComboBoxes.hpp" // filament slots: the sidebar row's combo refresh
 
 #include <algorithm>
 #include <cmath>
@@ -41,6 +43,7 @@
 #include <sstream>
 #include <vector>
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
 
 namespace Slic3r { namespace GUI { namespace RemoteAPI {
@@ -118,6 +121,8 @@ static std::string api_config_unit(const std::string &key)
 
 static int find_object_index(const Model &model, uint64_t id); // defined with the M4b object handlers below
 static bool sensitive_writes_allowed(); // defined with the sensitive-key policy below
+static nlohmann::json discard_preset_edits();          // defined with the project handlers below
+static bool project_has_unsaved_changes(Plater *plater); // defined with the project handlers below
 
 
 void Controller::notify_config_changed(int preset_type)
@@ -278,9 +283,13 @@ Response Controller::handle_status()
             {"plates", {{"count", plates.get_plate_count()}, {"current", plates.get_curr_plate_index()}}},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "sensitive_key_policy", "plates"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "sensitive_key_policy", "plates", "project", "plate_settings", "filament_slots"}},
             {"sensitive_keys_allowed", sensitive_writes_allowed()},
             {"project", plater->get_project_filename().ToUTF8().data()},
+            // project: the window title's name, and whether File > Save has something to
+            // write (plater edits, modified presets, or undo-stack changes since the save).
+            {"project_name", std::string(plater->get_project_name().ToUTF8().data())},
+            {"project_dirty", project_has_unsaved_changes(plater)},
             {"objects", objects},
             {"presets", {
                 {"printer",  bundle->printers.get_selected_preset_name()},
@@ -1316,17 +1325,7 @@ Response Controller::handle_select_preset(const std::string &body)
         // (that is exactly the modal deadlock above), so instead report every group we
         // discarded, and name them in the on-screen notification, so the loss is
         // visible to both the caller and whoever is at the machine.
-        nlohmann::json discarded = nlohmann::json::array();
-        auto discard_if_dirty = [&discarded](PresetCollection &c, const char *group) {
-            if (c.current_is_dirty()) {
-                c.discard_current_changes();
-                discarded.push_back(group);
-            }
-        };
-        discard_if_dirty(bundle->prints, "print");
-        discard_if_dirty(bundle->filaments, "filament");
-        discard_if_dirty(bundle->sla_materials, "sla_material");
-        discard_if_dirty(bundle->printers, "printer");
+        nlohmann::json discarded = discard_preset_edits();
         bool ok = tab->select_preset(name, false, "", /*force_select=*/true, /*force_no_transfer=*/true);
         if (!ok) return {{"error", "select_cancelled"}};
         return {{"selected", name}, {"discarded_changes", discarded}};
@@ -2035,6 +2034,44 @@ Response Controller::handle_jobs_status()
 // plate list, the background process and the preview follow the change exactly
 // as they do for a click.
 
+static std::string bed_type_name(BedType bt)
+{
+    if (bt == btDefault) return "default";
+    const t_config_enum_names &names = ConfigOptionEnum<BedType>::get_enum_names();
+    return size_t(bt) < names.size() ? names[bt] : std::string("default");
+}
+
+static bool parse_bed_type(const std::string &s, BedType &out)
+{
+    if (boost::algorithm::iequals(s, "default")) { out = btDefault; return true; }
+    for (const auto &kv : ConfigOptionEnum<BedType>::get_enum_values())
+        if (boost::algorithm::iequals(kv.first, s)) { out = BedType(kv.second); return true; }
+    return false;
+}
+
+static nlohmann::json bed_type_choices()
+{
+    nlohmann::json arr = nlohmann::json::array();
+    arr.push_back("default");
+    for (const auto &kv : ConfigOptionEnum<BedType>::get_enum_values())
+        if (kv.second != btDefault) arr.push_back(kv.first);
+    return arr;
+}
+
+static std::string print_seq_name(PrintSequence ps)
+{
+    return ps == PrintSequence::ByLayer  ? "by_layer" :
+           ps == PrintSequence::ByObject ? "by_object" : "default";
+}
+
+static bool parse_print_seq(const std::string &s, PrintSequence &out)
+{
+    if (s == "default")                        { out = PrintSequence::ByDefault; return true; }
+    if (s == "by_layer"  || s == "by layer")   { out = PrintSequence::ByLayer;   return true; }
+    if (s == "by_object" || s == "by object")  { out = PrintSequence::ByObject;  return true; }
+    return false;
+}
+
 // One plate as JSON. `objects` is read back through PartPlate::contain_instance,
 // i.e. from the plate's own bookkeeping, not from positions.
 static nlohmann::json plate_json(PartPlateList &plates, int index, const Model &model)
@@ -2056,6 +2093,12 @@ static nlohmann::json plate_json(PartPlateList &plates, int index, const Model &
         {"locked", p->is_locked()},
         {"empty", p->empty()},
         {"slice_result_valid", p->is_slice_result_valid()},
+        // plate_settings: the plate's own override ("default" = none) and what it
+        // resolves to with the project-wide curr_bed_type / print_sequence.
+        {"bed_type", bed_type_name(p->get_bed_type())},
+        {"bed_type_effective", bed_type_name(p->get_bed_type(true))},
+        {"print_sequence", print_seq_name(p->get_print_seq())},
+        {"print_sequence_effective", print_seq_name(p->get_real_print_seq())},
         {"origin", {org.x(), org.y(), org.z()}},
         {"bbox_min", {bb.min.x(), bb.min.y(), bb.min.z()}},
         {"bbox_max", {bb.max.x(), bb.max.y(), bb.max.z()}},
@@ -2281,6 +2324,661 @@ Response Controller::handle_put_object_plate(uint64_t id, const std::string &bod
     return { 200, r };
 }
 
+// --- project: save / open / new ----------------------------------------------
+// GET /project, POST /project/save, POST /project/open, POST /project/new.
+// File > Save / Open / New run through modal prompts in the GUI (save the
+// changes first? keep the modified presets? overwrite the file?). A remote
+// caller cannot see or dismiss those, so every prompt is answered from the
+// request body and the GUI's remembered-choice settings are used to keep the
+// dialogs from opening. The work itself goes through the same Plater calls the
+// menu uses, so the title, dirty flag, undo stack and backup follow along.
+
+static bool path_is_3mf(const std::string &path)
+{
+    return path.size() > 4 && boost::algorithm::iends_with(path, ".3mf");
+}
+
+static std::string project_path_utf8(Plater *plater)
+{
+    return plater->get_project_filename(".3mf").ToUTF8().data();
+}
+
+// The plate-level "there is something to save" answer the GUI gives in its own
+// prompts: dirty_state (plater edits + modified presets) or an undo-stack change
+// since the last save.
+static bool project_has_unsaved_changes(Plater *plater)
+{
+    return plater->is_project_dirty() || !plater->up_to_date(false, false);
+}
+
+static nlohmann::json project_json(Plater *plater)
+{
+    const std::string path = project_path_utf8(plater);
+    return {
+        {"name", std::string(plater->get_project_name().ToUTF8().data())},
+        {"path", path},
+        {"saved", !path.empty()},
+        {"dirty", project_has_unsaved_changes(plater)},
+        {"plates", plater->get_partplate_list().get_plate_count()},
+        {"objects", (unsigned) plater->model().objects.size()},
+    };
+}
+
+// Preset groups with edits that are not saved to a preset. Named the way
+// PUT /preset's discarded_changes names them.
+static nlohmann::json dirty_preset_groups()
+{
+    auto *bundle = wxGetApp().preset_bundle;
+    nlohmann::json groups = nlohmann::json::array();
+    if (bundle->prints.current_is_dirty())        groups.push_back("print");
+    if (bundle->filaments.current_is_dirty())     groups.push_back("filament");
+    if (bundle->sla_materials.current_is_dirty()) groups.push_back("sla_material");
+    if (bundle->printers.current_is_dirty())      groups.push_back("printer");
+    return groups;
+}
+
+// Same as PUT /preset: drop the un-applied edits of every collection, so no
+// UnsavedChangesDialog can open on the path that follows. Returns the groups.
+static nlohmann::json discard_preset_edits()
+{
+    auto *bundle = wxGetApp().preset_bundle;
+    nlohmann::json discarded = nlohmann::json::array();
+    auto discard_if_dirty = [&discarded](PresetCollection &c, const char *group) {
+        if (c.current_is_dirty()) {
+            c.discard_current_changes();
+            discarded.push_back(group);
+        }
+    };
+    discard_if_dirty(bundle->prints, "print");
+    discard_if_dirty(bundle->filaments, "filament");
+    discard_if_dirty(bundle->sla_materials, "sla_material");
+    discard_if_dirty(bundle->printers, "printer");
+    return discarded;
+}
+
+// Plater::save_project without its file dialog and failure MessageDialog: the
+// same export strategy, then the same bookkeeping (backup, project name, undo
+// "saved" mark, dirty flags, title). GUI thread only. Returns an error token or "".
+static std::string save_project_to(Plater *plater, const std::string &path_utf8, uintmax_t &bytes)
+{
+    const wxString wpath = wxString::FromUTF8(path_utf8.c_str());
+    SaveStrategy strategy = SaveStrategy::SplitModel | SaveStrategy::ShareMesh;
+    if (wxGetApp().app_config->get_bool("export_sources_full_pathnames"))
+        strategy = strategy | SaveStrategy::FullPathSources;
+    if (plater->export_3mf(into_path(wpath), strategy) < 0)
+        return "save_failed";
+    Slic3r::remove_backup(plater->model(), false);
+    plater->set_project_filename(wpath);
+    plater->up_to_date(true, false);
+    plater->up_to_date(true, true);
+    wxGetApp().update_saved_preset_from_current_preset();
+    plater->reset_project_dirty_after_save();
+    plater->update_title_dirty_status();
+    boost::system::error_code ec;
+    bytes = boost::filesystem::file_size(into_path(wpath), ec);
+    if (ec) bytes = 0;
+    return {};
+}
+
+// The "save changes to the current project?" prompt, answered from the request:
+// fail (refuse while there are changes), save (to the project's own path), or
+// discard. Returns an error token or ""; `out` records what happened.
+static std::string answer_unsaved_prompt(Plater *plater, const std::string &if_unsaved, nlohmann::json &out)
+{
+    const bool dirty = project_has_unsaved_changes(plater);
+    out["had_unsaved_changes"] = dirty;
+    if (!dirty) return {};
+    if (if_unsaved == "fail") return "unsaved_changes";
+    if (if_unsaved == "save") {
+        const std::string current = project_path_utf8(plater);
+        if (current.empty()) return "no_project_path";
+        uintmax_t bytes = 0;
+        const std::string err = save_project_to(plater, current, bytes);
+        if (!err.empty()) return err;
+        out["saved"] = current;
+        out["saved_bytes"] = bytes;
+    }
+    return {}; // "discard"
+}
+
+// Sets an app-config key for the length of a scope and puts it back (or removes
+// it again when it was absent) however the scope is left: the keys these routes
+// touch silence GUI prompts, and a throw out of load_project must not leave the
+// user's "ask before..." settings switched off.
+class AppConfigOverride
+{
+public:
+    AppConfigOverride(const std::string &key, const std::string &value) : m_key(key)
+    {
+        AppConfig *ac = wxGetApp().app_config;
+        m_had  = ac->has(key);
+        m_prev = m_had ? ac->get(key) : std::string();
+        ac->set(key, value);
+    }
+    ~AppConfigOverride()
+    {
+        AppConfig *ac = wxGetApp().app_config;
+        if (m_had) ac->set(m_key, m_prev);
+        else       ac->erase("app", m_key);
+    }
+private:
+    std::string m_key, m_prev;
+    bool        m_had { false };
+};
+
+static bool parse_if_unsaved(const nlohmann::json &in, std::string &if_unsaved)
+{
+    if (!in.contains("if_unsaved") || in["if_unsaved"].is_null()) return true;
+    if (!in["if_unsaved"].is_string()) return false;
+    if_unsaved = in["if_unsaved"].get<std::string>();
+    return if_unsaved == "save" || if_unsaved == "discard" || if_unsaved == "fail";
+}
+
+static Response project_error_response(const nlohmann::json &r)
+{
+    const std::string e = r["error"].get<std::string>();
+    if (e == "file_not_found" || e == "directory_not_found") return { 404, r };
+    if (e == "slicing" || e == "exists" || e == "busy")  return { 409, r };
+    return { 422, r };
+}
+
+Response Controller::handle_get_project()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        nlohmann::json j = project_json(plater);
+        j["modified"] = dirty_preset_groups();
+        return j;
+    });
+    return { 200, r };
+}
+
+// POST /project/save  body (optional) {"path": "<orca-host path>.3mf" | null, "overwrite": false}
+// path null: save to the project's own path (File > Save). A path: File > Save As,
+// which refuses to replace an existing file unless overwrite is true. Saving the
+// project back onto its own path is a plain Save and never counts as overwriting.
+Response Controller::handle_save_project(const std::string &body)
+{
+    std::string path;
+    bool overwrite = false;
+    if (!body.empty()) {
+        nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+        if (!in.is_object()) return { 400, {{"error", "body_must_be_object"}} };
+        if (in.contains("path") && !in["path"].is_null()) {
+            if (!in["path"].is_string()) return { 400, {{"error", "path_must_be_string"}} };
+            path = in["path"].get<std::string>();
+        }
+        if (in.contains("overwrite")) {
+            if (!in["overwrite"].is_boolean()) return { 400, {{"error", "overwrite_must_be_boolean"}} };
+            overwrite = in["overwrite"].get<bool>();
+        }
+    }
+    if (!path.empty() && !path_is_3mf(path))
+        return { 400, {{"error", "not_3mf"}, {"detail", "the project path must end in .3mf"}} };
+
+    // 120 s: export_3mf renders a thumbnail per plate and writes every mesh.
+    nlohmann::json r = run_on_ui([path, overwrite]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        if (plater->is_background_process_slicing()) return {{"error", "slicing"}};
+        const std::string current = project_path_utf8(plater);
+        const std::string target  = path.empty() ? current : path;
+        if (target.empty())
+            return {{"error", "no_project_path"},
+                    {"detail", "the project has never been saved; pass a path"}};
+        const boost::filesystem::path bp = into_path(wxString::FromUTF8(target.c_str()));
+        boost::system::error_code ec;
+        if (!bp.parent_path().empty() && !boost::filesystem::is_directory(bp.parent_path(), ec))
+            return {{"error", "directory_not_found"}, {"path", target}};
+        if (!path.empty() && !overwrite && boost::filesystem::exists(bp, ec)) {
+            const boost::filesystem::path cur = into_path(wxString::FromUTF8(current.c_str()));
+            const bool own_file = !current.empty() && boost::filesystem::exists(cur, ec) &&
+                                  boost::filesystem::equivalent(bp, cur, ec);
+            if (!own_file)
+                return {{"error", "exists"}, {"path", target},
+                        {"detail", "a file is already there; pass overwrite:true to replace it"}};
+        }
+        uintmax_t bytes = 0;
+        const std::string err = save_project_to(plater, target, bytes);
+        if (!err.empty()) return {{"error", err}, {"path", target}};
+        return {{"saved", project_path_utf8(plater)}, {"bytes", bytes}, {"project", project_json(plater)}};
+    }, /*timeout_s=*/120);
+    if (r.contains("error")) {
+        if (r["error"] != "slicing")
+            api_notify("Couldn't save the project (" + r["error"].get<std::string>() + ")", true);
+        return project_error_response(r);
+    }
+    api_notify("Saved project " + boost::filesystem::path(r["saved"].get<std::string>()).filename().string());
+    return { 200, r };
+}
+
+// POST /project/open  body {"path": "<orca-host path>.3mf",
+//                           "if_unsaved": "save" | "discard" | "fail" (default fail),
+//                           "presets": "project" | "keep_current" (default project)}
+// File > Open Project: plates, objects, per-object and per-plate settings, the
+// slot -> preset mapping and colours, and the project's config. `presets`
+// decides whose printer/print/filament presets are selected afterwards: the
+// project's own (as the GUI does) or the ones selected before the open.
+Response Controller::handle_open_project(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+    if (!in.is_object() || !in.contains("path") || !in["path"].is_string())
+        return { 400, {{"error", "missing_path"}} };
+    const std::string path = in["path"].get<std::string>();
+    std::string if_unsaved = "fail";
+    if (!parse_if_unsaved(in, if_unsaved))
+        return { 400, {{"error", "bad_if_unsaved"}, {"detail", "save | discard | fail"}} };
+    std::string presets = "project";
+    if (in.contains("presets") && !in["presets"].is_null()) {
+        if (!in["presets"].is_string()) return { 400, {{"error", "bad_presets"}, {"detail", "project | keep_current"}} };
+        presets = in["presets"].get<std::string>();
+        if (presets != "project" && presets != "keep_current")
+            return { 400, {{"error", "bad_presets"}, {"detail", "project | keep_current"}} };
+    }
+    if (!path_is_3mf(path))
+        return { 422, {{"error", "unsupported_format"},
+                       {"detail", "open takes a .3mf project; POST /model imports geometry"}} };
+
+    // 120 s like POST /model: a large project takes a while to read and render.
+    nlohmann::json r = run_on_ui([this, path, if_unsaved, presets]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        auto   *bundle = wxGetApp().preset_bundle;
+        const wxString wpath = wxString::FromUTF8(path.c_str());
+        boost::system::error_code ec;
+        // file_not_found, not not_found: the MCP client reads a bare not_found as "route missing".
+        if (!boost::filesystem::is_regular_file(into_path(wpath), ec)) return {{"error", "file_not_found"}, {"path", path}};
+        if (plater->is_background_process_slicing()) return {{"error", "slicing"}};
+        if (plater->is_loading_project()) return {{"error", "busy"}};
+
+        nlohmann::json out = nlohmann::json::object();
+        const std::string err = answer_unsaved_prompt(plater, if_unsaved, out);
+        if (!err.empty()) {
+            nlohmann::json e = {{"error", err}, {"project", project_json(plater)}, {"modified", dirty_preset_groups()}};
+            if (err == "unsaved_changes")
+                e["detail"] = "pass if_unsaved: \"save\" or \"discard\"";
+            return e;
+        }
+
+        // What the open will replace. With presets: keep_current these are
+        // selected again once the project is in.
+        const std::string              printer_before   = bundle->printers.get_selected_preset_name();
+        const std::string              print_before     = bundle->prints.get_selected_preset_name();
+        const std::vector<std::string> filaments_before = bundle->filament_presets;
+
+        // Edits that are not saved to a preset would open an UnsavedChangesDialog
+        // in Plater::load_project's check. The project's config replaces them in
+        // any case (it is loaded over the presets it names), so drop them first
+        // and report that we did.
+        out["discarded_changes"] = discard_preset_edits();
+
+        // Plater::load_project asks "save changes?" through close_with_confirm,
+        // which honours the remembered answer in app config; a project whose
+        // presets carry custom G-code asks for confirmation unless that warning is
+        // off; and with a printer connected, load_files offers to sync its preset
+        // unless the choice is remembered. All three are set for the duration of
+        // the call and put back.
+        {
+            AppConfigOverride save_choice("save_project_choise", "no");
+            AppConfigOverride gcode_warn("no_warn_when_modified_gcodes", "true");
+            AppConfigOverride printer_sync("sync_after_load_file_show_flag", "false");
+            plater->load_project(wpath, "<loadall>"); // "<loadall>": open as a project, no import-type dialog
+        }
+
+        // load_project returns nothing; a file it could not read leaves the
+        // project name alone.
+        const boost::filesystem::path now = into_path(plater->get_project_filename(".3mf"));
+        const bool opened = !now.empty() && boost::filesystem::exists(now, ec) &&
+                            boost::filesystem::equivalent(now, into_path(wpath), ec);
+        if (!opened) return {{"error", "load_failed"}, {"path", path}};
+
+        if (presets == "keep_current") {
+            // The project's config sits as edits over the presets it selected;
+            // drop those (and reload the tabs, which still show them) and select
+            // the earlier presets back, printer first so the print and filament
+            // choices are judged against it. The pre-discard is what keeps
+            // Tab::select_preset from asking about unsaved edits.
+            if (!discard_preset_edits().empty())
+                wxGetApp().load_current_presets(false, false);
+            nlohmann::json restored = nlohmann::json::array();
+            auto reselect = [&restored](Preset::Type type, PresetCollection &c, const std::string &name, const char *group) {
+                if (name.empty() || c.get_selected_preset_name() == name) return;
+                if (c.find_preset(name, false, true) == nullptr) return; // gone since; keep the project's
+                Tab *tab = wxGetApp().get_tab(type);
+                if (tab != nullptr && tab->select_preset(name, false, "", /*force_select=*/true, /*force_no_transfer=*/true))
+                    restored.push_back(group);
+            };
+            reselect(Preset::TYPE_PRINTER, bundle->printers, printer_before, "printer");
+            reselect(Preset::TYPE_PRINT,   bundle->prints,   print_before,   "print");
+            bool filaments_changed = false;
+            for (size_t i = 0; i < filaments_before.size() && i < bundle->filament_presets.size(); ++i) {
+                if (bundle->filament_presets[i] == filaments_before[i]) continue;
+                if (bundle->filaments.find_preset(filaments_before[i], false, true) == nullptr) continue;
+                bundle->set_filament_preset(i, filaments_before[i]);
+                filaments_changed = true;
+            }
+            if (filaments_changed) {
+                restored.push_back("filament");
+                plater->sidebar().update_all_preset_comboboxes();
+                plater->sidebar().update_dynamic_filament_list();
+            }
+            // Unconditional: the discard alone changes what the plater slices with.
+            bundle->export_selections(*wxGetApp().app_config);
+            plater->update_project_dirty_from_presets();
+            plater->get_partplate_list().invalid_all_slice_result();
+            plater->on_config_change(bundle->full_config());
+            out["presets_restored"] = restored;
+        }
+
+        sync_slice_state_to_current_plate("slice.plate_changed");
+        out["opened"]  = project_path_utf8(plater);
+        out["project"] = project_json(plater);
+        out["plates"]  = plater->get_partplate_list().get_plate_count();
+        out["objects"] = (unsigned) plater->model().objects.size();
+        out["presets"] = {{"printer", bundle->printers.get_selected_preset_name()},
+                          {"print", bundle->prints.get_selected_preset_name()},
+                          {"filaments", bundle->filament_presets}};
+        return out;
+    }, /*timeout_s=*/120);
+    const std::string fn = boost::filesystem::path(path).filename().string();
+    if (r.contains("error")) {
+        if (r["error"] != "slicing" && r["error"] != "unsaved_changes")
+            api_notify("Couldn't open " + fn + " (" + r["error"].get<std::string>() + ")", true);
+        return project_error_response(r);
+    }
+    api_notify("Opened project " + fn);
+    return { 200, r };
+}
+
+// POST /project/new  body (optional) {"if_unsaved": "save" | "discard" | "fail"}
+// File > New Project. The GUI's second prompt (keep the modified presets for the
+// new project, or discard them?) is answered with Keep, which is what
+// Plater::new_project does when its confirmation is skipped: nothing is lost
+// that was not asked for, and the reply lists the groups carried over.
+Response Controller::handle_new_project(const std::string &body)
+{
+    std::string if_unsaved = "fail";
+    if (!body.empty()) {
+        nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+        if (!in.is_object()) return { 400, {{"error", "body_must_be_object"}} };
+        if (!parse_if_unsaved(in, if_unsaved))
+            return { 400, {{"error", "bad_if_unsaved"}, {"detail", "save | discard | fail"}} };
+    }
+    nlohmann::json r = run_on_ui([this, if_unsaved]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        if (plater->is_background_process_slicing()) return {{"error", "slicing"}};
+        if (plater->is_loading_project()) return {{"error", "busy"}};
+        nlohmann::json out = nlohmann::json::object();
+        const std::string err = answer_unsaved_prompt(plater, if_unsaved, out);
+        if (!err.empty()) {
+            nlohmann::json e = {{"error", err}, {"project", project_json(plater)}, {"modified", dirty_preset_groups()}};
+            if (err == "unsaved_changes")
+                e["detail"] = "pass if_unsaved: \"save\" or \"discard\"";
+            return e;
+        }
+        out["kept_changes"] = dirty_preset_groups();
+        // close_with_confirm drops the old project's backup folder before the
+        // model is replaced; with the confirmation skipped, do it here.
+        plater->model().set_backup_path("");
+        if (plater->new_project(/*skip_confirm=*/true, /*silent=*/false) == wxID_CANCEL)
+            return {{"error", "cancelled"}};
+        sync_slice_state_to_current_plate("slice.plate_changed");
+        out["ok"]      = true;
+        out["project"] = project_json(plater);
+        return out;
+    }, /*timeout_s=*/60);
+    if (r.contains("error")) {
+        if (r["error"] != "slicing" && r["error"] != "unsaved_changes")
+            api_notify("Couldn't start a new project (" + r["error"].get<std::string>() + ")", true);
+        return project_error_response(r);
+    }
+    api_notify("New project");
+    return { 200, r };
+}
+
+// --- per-plate settings ------------------------------------------------------
+// PATCH /plates/{i}  body {"bed_type": ..., "name": ..., "print_sequence": ...}
+// (each optional / null = leave alone). What the Plate Settings dialog writes:
+// a plate's own bed type and print sequence override the project-wide
+// curr_bed_type / print_sequence for that plate alone, and "default" takes the
+// override away again. The values are the config's own enum keys.
+
+Response Controller::handle_patch_plate(int index, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+    if (!in.is_object()) return { 400, {{"error", "body_must_be_object"}} };
+    bool has_bed = false, has_name = false, has_seq = false;
+    BedType       bt = btDefault;
+    PrintSequence ps = PrintSequence::ByDefault;
+    std::string   name;
+    if (in.contains("bed_type") && !in["bed_type"].is_null()) {
+        if (!in["bed_type"].is_string() || !parse_bed_type(in["bed_type"].get<std::string>(), bt))
+            return { 400, {{"error", "unknown_bed_type"}, {"allowed", bed_type_choices()}} };
+        has_bed = true;
+    }
+    if (in.contains("print_sequence") && !in["print_sequence"].is_null()) {
+        if (!in["print_sequence"].is_string() || !parse_print_seq(in["print_sequence"].get<std::string>(), ps))
+            return { 400, {{"error", "unknown_print_sequence"}, {"allowed", {"default", "by_layer", "by_object"}}} };
+        has_seq = true;
+    }
+    if (in.contains("name") && !in["name"].is_null()) {
+        if (!in["name"].is_string()) return { 400, {{"error", "name_must_be_string"}} };
+        name = in["name"].get<std::string>();
+        has_name = true;
+    }
+    if (!has_bed && !has_seq && !has_name)
+        return { 400, {{"error", "nothing_to_set"}, {"detail", "pass bed_type, name and/or print_sequence"}} };
+
+    nlohmann::json r = run_on_ui([index, has_bed, bt, has_seq, ps, has_name, name]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        PartPlateList &plates = plater->get_partplate_list();
+        if (index < 0 || index >= plates.get_plate_count())
+            return {{"error", "unknown_plate"}, {"count", plates.get_plate_count()}};
+        if (plater->is_background_process_slicing()) return {{"error", "slicing"}};
+        PartPlate *plate = plates.get_plate(index);
+        nlohmann::json changed = nlohmann::json::array();
+        // Same calls, in the same order, as Plater::open_platesettings_dialog's
+        // confirm handler; each setter marks the plate's slice stale on a real change.
+        if (has_bed && plate->get_bed_type() != bt) {
+            plate->set_bed_type(bt);
+            changed.push_back("bed_type");
+        }
+        if (has_seq && plate->get_print_seq() != ps) {
+            plate->set_print_seq(ps);
+            changed.push_back("print_sequence");
+        }
+        if (has_name && plate->get_plate_name() != name) {
+            plate->set_plate_name(name);
+            // The sidebar's plate row carries the name (ObjectList::update_name_in_model).
+            if (ObjectDataViewModel *om = wxGetApp().obj_list()->GetModel())
+                om->SetCurSelectedPlateFullName(index, name);
+            changed.push_back("name");
+        }
+        if (!changed.empty()) {
+            plater->update_project_dirty_from_presets();
+            plater->set_plater_dirty(true);
+            // The "print by object" hint is about the plate on screen.
+            if (index == plates.get_curr_plate_index())
+                plater->config_change_notification(*plate->config(), "print_sequence");
+            plater->update();
+            wxGetApp().obj_list()->update_selections();
+            std::string msg = "Plate " + std::to_string(index + 1) + ":";
+            for (const auto &c : changed) {
+                const std::string k = c.get<std::string>();
+                msg += " " + k + "=" + (k == "bed_type" ? bed_type_name(plate->get_bed_type()) :
+                                        k == "print_sequence" ? print_seq_name(plate->get_print_seq()) : name);
+            }
+            api_notify(msg);
+        }
+        return {{"changed", changed}, {"plate", plate_json(plates, index, plater->model())}};
+    });
+    if (r.contains("error")) {
+        if (r["error"] == "unknown_plate") return { 404, r };
+        if (r["error"] == "slicing")       return { 409, r };
+        return { 422, r };
+    }
+    return { 200, r };
+}
+
+// --- filament slots ----------------------------------------------------------
+// GET /filaments and PUT /filaments/{slot}. The Prepare page's filament rows:
+// each project slot holds a filament preset and a colour. PUT /preset switches
+// the preset open in the Filament tab; this assigns one to a slot, as the row's
+// dropdown does, and leaves unsaved print and printer edits alone.
+
+static nlohmann::json filament_slots_json()
+{
+    auto *bundle = wxGetApp().preset_bundle;
+    const auto *colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    nlohmann::json arr = nlohmann::json::array();
+    for (size_t i = 0; i < bundle->filament_presets.size(); ++i) {
+        const std::string &name   = bundle->filament_presets[i];
+        const Preset      *preset = bundle->filaments.find_preset(name, false, true);
+        nlohmann::json slot = {{"slot", (unsigned) (i + 1)}, {"preset", name},
+                               {"colour", colours != nullptr && i < colours->values.size() ? colours->values[i] : std::string()}};
+        if (preset != nullptr) {
+            const auto *type = preset->config.option<ConfigOptionStrings>("filament_type");
+            if (type != nullptr && !type->values.empty()) slot["type"] = type->values.front();
+            slot["system"] = preset->is_system;
+        }
+        arr.push_back(slot);
+    }
+    return arr;
+}
+
+Response Controller::handle_get_filaments()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        nlohmann::json slots = filament_slots_json();
+        return {{"slots", slots}, {"count", slots.size()}};
+    });
+    return { 200, r };
+}
+
+// PUT /filaments/{slot}  body {"preset": "<filament preset>" | null, "colour": "#RRGGBB" | null}
+// slot is 1-based, as the window numbers the rows.
+Response Controller::handle_put_filament_slot(int slot, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+    if (!in.is_object()) return { 400, {{"error", "body_must_be_object"}} };
+    std::string preset, colour;
+    if (in.contains("preset") && !in["preset"].is_null()) {
+        if (!in["preset"].is_string() || in["preset"].get<std::string>().empty())
+            return { 400, {{"error", "preset_must_be_string"}} };
+        preset = in["preset"].get<std::string>();
+    }
+    if (in.contains("colour") && !in["colour"].is_null()) {
+        if (!in["colour"].is_string()) return { 400, {{"error", "colour_must_be_string"}} };
+        colour = in["colour"].get<std::string>();
+        const std::string cerr = colour_list_error(colour);
+        if (!cerr.empty()) return { 400, {{"error", "bad_colour"}, {"detail", cerr}} };
+    }
+    if (preset.empty() && colour.empty())
+        return { 400, {{"error", "nothing_to_set"}, {"detail", "pass preset and/or colour"}} };
+    if (slot < 1) return { 400, {{"error", "bad_slot"}, {"detail", "slots are numbered from 1"}} };
+
+    nlohmann::json r = run_on_ui([slot, preset, colour]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        auto   *bundle = wxGetApp().preset_bundle;
+        const size_t idx = size_t(slot) - 1;
+        if (idx >= bundle->filament_presets.size())
+            return {{"error", "unknown_slot"}, {"count", (unsigned) bundle->filament_presets.size()}};
+        if (plater->is_background_process_slicing()) return {{"error", "slicing"}};
+
+        nlohmann::json changed   = nlohmann::json::array();
+        nlohmann::json discarded = nlohmann::json::array();
+        std::string    apply_colour = colour;
+        std::string    old_preset   = bundle->filament_presets[idx];
+        if (!preset.empty()) {
+            const Preset *p = bundle->filaments.find_preset(preset, false, true);
+            if (p == nullptr) return {{"error", "unknown_preset"}, {"preset", preset}};
+            if (old_preset != p->name) {
+                // The row's dropdown (Plater::priv::on_select_preset, filament branch).
+                bundle->set_filament_preset(idx, p->name);
+                changed.push_back("preset");
+                // Not mirrored: the dropdown's flush-volume recalculation when a slot
+                // flips between support and non-support filament (an "all" auto-calc
+                // setting); PUT /config can set flush_volumes_matrix.
+                // On a single-filament printer the dropdown also switches the Filament
+                // tab to the preset (Sidebar::update_presets keeps slot 1 and the tab in
+                // step). Tab::select_preset would ask about unsaved filament edits, so
+                // those are dropped first and reported; print and printer edits stay.
+                if (!plater->sidebar().is_multifilament()) {
+                    if (bundle->filaments.current_is_dirty()) {
+                        bundle->filaments.discard_current_changes();
+                        discarded.push_back("filament");
+                    }
+                    if (Tab *tab = wxGetApp().get_tab(Preset::TYPE_FILAMENT))
+                        tab->select_preset(p->name, false, "", /*force_select=*/true, /*force_no_transfer=*/true);
+                }
+                // A preset that carries its own colour recolours the slot, as the
+                // dropdown does (PresetComboBox::update_ams_color); a colour in the
+                // same request wins.
+                if (apply_colour.empty()) {
+                    const auto *def = p->config.option<ConfigOptionStrings>("default_filament_colour");
+                    if (def != nullptr && !def->values.empty() && !def->values.front().empty())
+                        apply_colour = def->values.front();
+                }
+            }
+        }
+        if (!apply_colour.empty()) {
+            DynamicPrintConfig &proj = bundle->project_config;
+            const auto *cur = proj.option<ConfigOptionStrings>("filament_colour");
+            if (cur != nullptr && idx < cur->values.size() && cur->values[idx] != apply_colour) {
+                // The swatch (PlaterPresetComboBox::sync_colour_config, PresetComboBox::
+                // update_ams_color): the colour keys live in project_config only, so the
+                // three vectors are patched there, in step with each other, and
+                // on_config_change then repaints the scene, the object list and the
+                // sidebar from the project config.
+                DynamicPrintConfig cfg_new;
+                auto patch = [&proj, &cfg_new, idx](const char *key, const std::string &value) {
+                    auto *opt = static_cast<ConfigOptionStrings *>(proj.option<ConfigOptionStrings>(key, true)->clone());
+                    if (idx >= opt->values.size()) opt->values.resize(idx + 1);
+                    opt->values[idx] = value;
+                    cfg_new.set_key_value(key, opt);
+                };
+                patch("filament_colour", apply_colour);
+                patch("filament_multi_colour", apply_colour); // one plain colour, no gradient
+                patch("filament_colour_type", "1");          // "1" = single colour (sync_colour_config)
+                proj.apply(cfg_new);
+                plater->on_config_change(cfg_new);
+                changed.push_back("colour");
+            }
+        }
+        if (!changed.empty()) {
+            // The rest of the dropdown's epilogue.
+            plater->update_project_dirty_from_presets();
+            bundle->export_selections(*wxGetApp().app_config);
+            Sidebar &sidebar = plater->sidebar();
+            sidebar.update_dynamic_filament_list();
+            auto &combos = sidebar.combos_filament();
+            if (idx < combos.size() && combos[idx] != nullptr) combos[idx]->update();
+            // Every plate's slice used the old filament.
+            plater->get_partplate_list().invalid_all_slice_result();
+            plater->on_config_change(bundle->full_config());
+            std::string msg = "Filament slot " + std::to_string(slot) + ": ";
+            if (changed.front() == "preset") {
+                msg += old_preset + " -> " + bundle->filament_presets[idx];
+                if (changed.size() > 1) msg += ", colour " + apply_colour;
+            } else {
+                msg += "colour " + apply_colour;
+            }
+            if (!discarded.empty()) msg += " (discarded unsaved filament edits)";
+            api_notify(msg);
+        }
+        const auto *colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+        return {{"slot", slot}, {"preset", bundle->filament_presets[idx]},
+                {"colour", colours != nullptr && idx < colours->values.size() ? colours->values[idx] : std::string()},
+                {"changed", changed}, {"discarded_changes", discarded}};
+    });
+    if (r.contains("error")) {
+        const std::string e = r["error"].get<std::string>();
+        if (e == "unknown_slot")   return { 404, r };
+        if (e == "unknown_preset") { api_notify("No such filament preset '" + preset + "'", true); return { 422, r }; }
+        if (e == "slicing")        return { 409, r };
+        return { 422, r };
+    }
+    return { 200, r };
+}
+
 Response Controller::dispatch(const Request &req)
 {
     try {
@@ -2347,6 +3045,40 @@ Response Controller::dispatch(const Request &req)
         if (is("POST", "/api/v1/orient"))       return handle_orient();
         if (is("GET",  "/api/v1/jobs/status"))  return handle_jobs_status();
         if (is("GET",  "/api/v1/plates"))       return handle_get_plates();
+        if (is("GET",  "/api/v1/project"))      return handle_get_project();
+        if (is("POST", "/api/v1/project/save")) {
+            try { return handle_save_project(req.body); }
+            catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+        }
+        if (is("POST", "/api/v1/project/open")) {
+            try { return handle_open_project(req.body); }
+            catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+        }
+        if (is("POST", "/api/v1/project/new")) {
+            try { return handle_new_project(req.body); }
+            catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+        }
+        if (is("GET",  "/api/v1/filaments"))    return handle_get_filaments();
+        {
+            // filament slots: PUT /api/v1/filaments/<slot> (1-based, as the window numbers them)
+            static const std::string pfx = "/api/v1/filaments/";
+            std::string path = t.substr(0, t.find('?'));
+            if (path.size() > pfx.size() && path.compare(0, pfx.size(), pfx) == 0) {
+                std::string slot_str = path.substr(pfx.size());
+                int slot = -1;
+                try {
+                    size_t used = 0;
+                    slot = std::stoi(slot_str, &used);
+                    if (used != slot_str.size()) slot = -1;
+                } catch (...) { slot = -1; }
+                if (slot < 0) return { 400, {{"error", "bad_slot"}} };
+                if (req.method == "PUT") {
+                    try { return handle_put_filament_slot(slot, req.body); }
+                    catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+                }
+                return { 404, {{"error", "not_found"}} };
+            }
+        }
         if (is("POST", "/api/v1/plates")) {
             try { return handle_create_plate(req.body); }
             catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
@@ -2369,6 +3101,10 @@ Response Controller::dispatch(const Request &req)
                 } catch (...) { idx = -1; }
                 if (idx < 0) return { 400, {{"error", "bad_plate_index"}} };
                 if (req.method == "DELETE" && action.empty())  return handle_delete_plate(idx);
+                if (req.method == "PATCH"  && action.empty()) {
+                    try { return handle_patch_plate(idx, req.body); }
+                    catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+                }
                 if (req.method == "POST"   && action == "select") return handle_select_plate(idx);
                 return { 404, {{"error", "not_found"}} };
             }

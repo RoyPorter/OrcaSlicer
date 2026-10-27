@@ -45,6 +45,13 @@ Base URL: `http://<host>:13130/api/v1`
 | POST | `/plates/{i}/select` | Make plate `i` the current one |
 | DELETE | `/plates/{i}` | Delete plate `i` (its objects are parked beside the bed, not deleted) |
 | POST | `/objects/{id}/plate` | Move an object onto plate `i` |
+| PATCH | `/plates/{i}` | Set a plate's own bed type, name and print sequence |
+| GET | `/project` | Project name, path, dirty flag, plate and object counts |
+| POST | `/project/save` | File > Save / Save As (`{"path", "overwrite"}`), no dialogs |
+| POST | `/project/open` | File > Open Project, the unsaved-changes prompt answered by `if_unsaved` |
+| POST | `/project/new` | File > New Project, same `if_unsaved` |
+| GET | `/filaments` | The project's filament slots: preset, colour, type |
+| PUT | `/filaments/{slot}` | Assign a filament preset and/or colour to a slot (1-based) |
 
 ### GET /status
 
@@ -55,7 +62,7 @@ curl -H "X-Api-Token: $TOK" http://localhost:13130/api/v1/status
 {
   "app": "OrcaSlicer", "app_version": "2.3.2", "api_version": "1.0",
   "capabilities": ["status","config","slice","events"],
-  "project": "",
+  "project": "", "project_name": "Untitled", "project_dirty": false,
   "objects": [{"name":"cube","size_mm":[20,20,20]}],
   "presets": {"printer":"...","print":"...","filaments":["..."]},
   "modified": {"print":["layer_height"],"filament":[],"printer":[]},
@@ -290,6 +297,148 @@ next plate appears, so `POST /plates` straight after a delete picks them back up
 `404 unknown_object | unknown_plate | unknown_instance`, `422 plate_locked` (the
 target or the plate it sits on is locked; `plate` names which) `| move_failed`,
 `409 slicing`, `400 missing_plate`.
+
+### PATCH /plates/{i}
+
+```bash
+curl -X PATCH -H "X-Api-Token: $TOK" -H "Content-Type: application/json" \
+  -d '{"bed_type": "Textured PEI Plate", "name": "floats", "print_sequence": "by_object"}' \
+  http://localhost:13130/api/v1/plates/2
+```
+```json
+{ "changed": ["bed_type", "print_sequence", "name"], "plate": { "...": "as in GET /plates" } }
+```
+What the Plate Settings dialog writes. Each field is optional (or `null`) and only a
+real change is applied. `bed_type` takes the config's own enum keys (`Cool Plate`,
+`Engineering Plate`, `High Temp Plate`, `Textured PEI Plate`, `Textured Cool Plate`,
+`Supertack Plate`; case does not matter) or `default`, which takes the plate's
+override away so it follows the project-wide `curr_bed_type` again.
+`print_sequence` is `by_layer`, `by_object` or `default` (follow the print preset).
+`GET /plates` reports both the plate's own value (`bed_type`, `print_sequence`,
+`default` when it has none) and what it resolves to (`bed_type_effective`,
+`print_sequence_effective`). A change marks the plate's slice stale and the project
+dirty. Errors: `404 unknown_plate`, `409 slicing`, `400 unknown_bed_type` (with the
+`allowed` list) `| unknown_print_sequence | nothing_to_set`.
+
+## Project
+
+File > Save, Open and New each go through modal prompts in the window ("save the
+changes first?", "keep the modified presets?", "overwrite?"). A remote caller cannot
+see those, so every prompt is answered from the request and the GUI's own
+remembered-choice settings are used to keep the dialogs closed for the duration of
+the call. The work goes through the same `Plater` calls as the menu, so the window
+title, dirty flag, undo stack and the periodic backup follow along. `GET /status`
+reports `project` (path, empty until saved), `project_name` and `project_dirty`,
+and lists `project` in `capabilities`.
+
+Known limits: a 3MF from another slicer, a newer OrcaSlicer, or one that needs a
+migration can still raise an informational dialog inside the loader (projects saved
+by this build open without one). And `Plater::load_project` empties the window
+before it reads the file, so a file that turns out to be unreadable leaves an empty
+project behind and answers `422 load_failed`; the preset edits dropped for the open
+are gone by then too. Save first when that matters.
+
+### GET /project
+
+```json
+{ "name": "float_spinner", "path": "/Users/roy/float_spinner.3mf", "saved": true,
+  "dirty": true, "plates": 4, "objects": 9, "modified": ["print"] }
+```
+`dirty` is what File > Save would have to write: plater edits, modified presets, or
+undo-stack changes since the last save. `modified` names the preset groups with
+unsaved edits.
+
+### POST /project/save
+
+```bash
+curl -X POST -H "X-Api-Token: $TOK" -H "Content-Type: application/json" \
+  -d '{"path": "/Users/roy/float_spinner.3mf"}' http://localhost:13130/api/v1/project/save
+```
+```json
+{ "saved": "/Users/roy/float_spinner.3mf", "bytes": 1834021, "project": { "...": "as in GET /project" } }
+```
+The body is optional. Without `path` (or with `null`) the project is saved to its
+own path, as File > Save does; `422 no_project_path` when it has never been saved.
+With a `path` it is Save As: an existing file at that path is refused with
+`409 exists` unless `overwrite` is `true` (saving the project back onto its own
+path is a plain Save and never counts). The file holds what the GUI writes:
+plates, placement, per-object and per-plate settings, height ranges, slot
+presets and colours, and unsaved config edits. Afterwards `GET /status` reports
+the new `project` path and `project_dirty: false`. Errors: `400 not_3mf`,
+`404 directory_not_found`, `409 slicing`, `422 save_failed`.
+
+### POST /project/open
+
+```bash
+curl -X POST -H "X-Api-Token: $TOK" -H "Content-Type: application/json" \
+  -d '{"path": "/Users/roy/float_spinner.3mf", "if_unsaved": "discard"}' \
+  http://localhost:13130/api/v1/project/open
+```
+```json
+{ "opened": "/Users/roy/float_spinner.3mf", "plates": 4, "objects": 9,
+  "had_unsaved_changes": true, "discarded_changes": [],
+  "presets": { "printer": "...", "print": "...", "filaments": ["...", "..."] },
+  "project": { "...": "as in GET /project" } }
+```
+File > Open Project, not a geometry import: plates, objects, per-object and
+per-plate settings, slot presets and colours come back. `if_unsaved` answers the
+"save changes to the current project?" prompt: `fail` (the default) refuses with
+`422 unsaved_changes` and changes nothing, `save` writes the current project to its
+own path first (`422 no_project_path` if it has none; the reply carries `saved`),
+`discard` goes ahead. Unsaved preset edits are dropped before the open, because the
+project's config replaces them in any case; `discarded_changes` names the groups.
+
+`presets` is `project` (the default: the project's printer, print and filament
+presets are selected, as the GUI does) or `keep_current`: the project is opened and
+the presets selected before the call are selected again (printer, then print, then
+each filament slot, for names that still exist); `presets_restored` says which. The
+project's own config edits are not kept in that mode. Errors: `404 file_not_found`,
+`409 slicing | busy`, `422 unsaved_changes | no_project_path | unsupported_format |
+load_failed`, `400 missing_path | bad_if_unsaved | bad_presets`.
+
+### POST /project/new
+
+```json
+{ "ok": true, "had_unsaved_changes": false, "kept_changes": [], "project": { "name": "Untitled", "path": "", "...": "" } }
+```
+File > New Project with the same `if_unsaved` handling (body optional). The GUI's
+second prompt, keep the modified presets for the new project or discard them, is
+answered with Keep: unsaved preset edits carry over and `kept_changes` names the
+groups. Use `PUT /preset` to drop them. Errors as for open.
+
+## Filament slots
+
+`PUT /preset` with `type: filament` switches the preset open in the Filament tab.
+The Prepare page's filament rows are the project's slots: each holds a preset and a
+colour, and that is what per-object `extruder` numbers refer to. These routes read
+and assign them the way the row's dropdown and colour swatch do.
+
+### GET /filaments
+
+```json
+{ "slots": [ { "slot": 1, "preset": "Generic PETG @BBL X1C", "colour": "#FF8000", "type": "PETG", "system": true },
+             { "slot": 2, "preset": "My LW-ASA", "colour": "#808080", "type": "ASA", "system": false } ],
+  "count": 2 }
+```
+
+### PUT /filaments/{slot}
+
+```bash
+curl -X PUT -H "X-Api-Token: $TOK" -H "Content-Type: application/json" \
+  -d '{"preset": "My LW-ASA", "colour": "#808080"}' http://localhost:13130/api/v1/filaments/4
+```
+```json
+{ "slot": 4, "preset": "My LW-ASA", "colour": "#808080", "changed": ["preset", "colour"], "discarded_changes": [] }
+```
+`slot` is 1-based, as the window numbers the rows. `preset` (user presets included)
+and `colour` (`#RRGGBB` or `#RRGGBBAA`) are each optional. A preset that carries a
+`default_filament_colour` recolours the slot as the dropdown does, unless a `colour`
+is passed in the same request. Unsaved print and printer edits are left alone. On a
+single-filament printer the dropdown also moves the Filament tab to the preset, and
+unsaved filament edits are dropped to let that happen (`discarded_changes`); with
+several slots nothing is discarded. Every plate's slice is marked stale. Errors:
+`404 unknown_slot` (with `count`), `422 unknown_preset`, `409 slicing`,
+`400 bad_colour | nothing_to_set | bad_slot`.
 
 ## Notes & limits
 
